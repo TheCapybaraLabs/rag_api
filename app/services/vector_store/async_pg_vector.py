@@ -116,3 +116,17 @@ class AsyncPgVector(ExtendedPgVector):
         return await self._run_in_executor(
             executor, super().delete_file_batch, file_id, user_id
         )
+
+    async def replace_file_batch(
+        self,
+        file_id: str,
+        user_id: str,
+        documents: List[Document],
+        ids: Optional[List[str]] = None,
+        executor=None,
+    ) -> List[str]:
+        """Async version of replace_file_batch (atomic delete+insert swap)."""
+        executor = executor or self._get_thread_pool()
+        return await self._run_in_executor(
+            executor, super().replace_file_batch, file_id, user_id, documents, ids
+        )

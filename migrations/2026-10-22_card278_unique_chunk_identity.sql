@@ -65,6 +65,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_langchain_pg_embedding_chunk_identity
 --
 -- Nota: com o índice ativo, o /embed idempotente (dedup por digest no
 -- document_routes.py) evita a violação na reingestão idêntica; conteúdo
--- ALTERADO passa pelo caminho de substituição (delete escopado por namespace
--- + reinserção), que nunca colide consigo mesmo.
+-- ALTERADO passa pelo swap atômico (replace_file_batch: delete escopado por
+-- namespace + reinserção numa ÚNICA transação — falha de provider/insert
+-- reverte tudo e o lote anterior permanece). Uma corrida de ingestão
+-- concorrente vira violação DESTE índice, tratada sem delete por file_id.
 -- ============================================================================

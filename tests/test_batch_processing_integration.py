@@ -258,6 +258,9 @@ class TestConfigurationBehavior:
 
         mock_store = AsyncMock(spec=AsyncPgVector)
         mock_store.aadd_documents = AsyncMock(return_value=["id1", "id2"])
+        # Card #278: sem lote armazenado, o probe de dedup não pode desviar o fluxo
+        # para o swap atômico — o objetivo aqui é o caminho direto do insert.
+        mock_store.get_file_batch_digests = AsyncMock(return_value=None)
 
         docs = [Document(page_content="test", metadata={})]
 

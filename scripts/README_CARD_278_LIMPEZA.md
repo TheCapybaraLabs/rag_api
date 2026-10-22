@@ -17,15 +17,23 @@ temporário do provisionador), mas **não é critério de limpeza**.
 ## Regras (card #278)
 
 1. **Nunca deletar por prefixo** `provision-` ou por nome. A identificação é por
-   agrupamento de conteúdo e a exclusão é **somente por uuid físico** listado no
-   manifesto gerado na mesma execução.
+   agrupamento de conteúdo e a exclusão é **somente por uuid físico** — no modo
+   `--execute`, **exatamente** os uuids aprovados no manifesto do dry-run
+   (o script nunca reagrupa o banco vivo na hora de apagar).
 2. **Âncora de rollback antes de excluir**: snapshot das linhas candidatas
-   (`CREATE TABLE ... AS SELECT` com embedding completo + metadados), contagens
-   antes/depois e manifesto JSON.
-3. **Agrupamento**: `file_id + page + md5(document)`; com `--by-namespace`,
-   `file_id + user_id + page + md5(document)` — separa repetição dentro do mesmo
-   namespace (duplicata efetiva) de cópias legítimas entre agentes (preservar).
-4. **Não usar `DELETE /documents`** para este fim: apaga por arquivo e atinge
+   (`CREATE TABLE ... AS SELECT` com embedding completo + metadados) na **mesma
+   transação** do delete — ou os dois acontecem, ou nenhum.
+3. **Agrupamento (sempre por namespace e posição)**:
+   `file_id + user_id + page + chunk_index + md5(document)`.
+   * `user_id` no grupo preserva cópias legítimas do mesmo chunk entre
+     agentes/namespaces (`--no-by-namespace` existe só para inventário e é
+     **recusado com `--execute`**).
+   * `chunk_index` no grupo não funde chunks distintos de texto repetido na
+     mesma página; linhas legadas sem `chunk_index` agrupam entre si (NULL).
+4. **Sobrevivente = linha mais antiga**: menor `ctid` (ordem física de inserção).
+   **Não** se usa o menor uuid — uuid v4 é aleatório e preservaria o lote por
+   acaso (possivelmente o lixo `provision-/temp`).
+5. **Não usar `DELETE /documents`** para este fim: apaga por arquivo e atinge
    todos os namespaces.
 
 ## Confirmação de produção (backend/versão)
@@ -41,42 +49,49 @@ temporário do provisionador), mas **não é critério de limpeza**.
 ## Procedimento
 
 ```bash
-# 0. Inventário somente-leitura em TODA coleção alvo (dry-run é o default)
+# 0. Inventário / dry-run (default; não altera nada; grava o manifesto)
 python scripts/cleanup_duplicate_vectors.py \
     --collection <COLLECTION_NAME> \
     --file-id <file_id_1> --file-id <file_id_2> \
-    --by-namespace \
     --manifesto /tmp/card278_manifesto.json
 
-# → imprime grupos duplicados, grava manifesto com uuids "manter"/"remover".
+# → imprime grupos duplicados, grava manifesto com uuid "manter"/"remover".
+#   (--by-namespace é o DEFAULT; --no-by-namespace só para inventário. --all
+#    também é só inventário.)
 
-# 1. Com OK DO DONO dos tenants, aplicar o manifesto:
+# 1. REVISE o manifesto (uuids a manter/remover por grupo) e obtenha o OK do
+#    dono dos tenants.
+
+# 2. Com OK, aplicar EXATAMENTE o manifesto revisado:
 python scripts/cleanup_duplicate_vectors.py \
-    --collection <COLLECTION_NAME> \
-    --file-id <file_id_1> --file-id <file_id_2> \
-    --by-namespace \
     --manifesto /tmp/card278_manifesto.json \
-    --execute            # pede confirmação interativa (digite o total exato)
+    --execute --yes        # sem --yes pede confirmação interativa (digite o total)
 ```
 
 O que o modo `--execute` faz, em ordem:
 
-1. Recalcula os grupos no estado atual do banco.
-2. Cria snapshot `card278_backup_<ts>` com as linhas candidatas completas
-   (embedding + `cmetadata` + `document`).
-3. Exclui **exclusivamente** os uuids `remover_uuids` do manifesto.
-4. Reconta e grava `removidos`, `total_linhas_depois` e o SQL de rollback no
-   próprio manifesto.
+1. **Lê os `remover_uuids` do manifesto do dry-run** (exige `--manifesto`;
+   recusa `--file-id`/`--all`, que não participam da seleção).
+2. Verifica quais desses uuids **ainda existem** (avisa os sumidos; só eles
+   diferem da lista aprovada).
+3. Numa **única transação**: cria o snapshot `card278_backup_<ts>` com as linhas
+   completas (embedding + `cmetadata` + `document`) e exclui **exatamente** os
+   uuids verificados. Se o count do delete divergir do snapshot, a transação é
+   revertida.
+4. Grava um **relatório de execução separado**
+   (`<manifesto>.execucao.json`) com `removidos`, `uuids_ausentes`,
+   `total_linhas_depois` e o SQL de rollback com a **lista concreta de uuids**.
+   O manifesto aprovado **não é sobrescrito**.
 
 ## Rollback (âncora)
 
-Todo modo `--execute` grava no manifesto o SQL exato; genericamente:
+Todo modo `--execute` grava o SQL exato no relatório de execução; genericamente:
 
 ```sql
 INSERT INTO langchain_pg_embedding (uuid, collection_id, embedding, document, cmetadata, custom_id)
 SELECT uuid, collection_id, embedding, document, cmetadata, custom_id
 FROM card278_backup_<ts>
-WHERE uuid = ANY(<removidos_do_manifesto>);
+WHERE uuid = ANY('{<uuid1>,<uuid2>,...}'::uuid[]);  -- lista concreta, do relatório
 ```
 
 Validar a restauração em ambiente isolado antes de qualquer execução real

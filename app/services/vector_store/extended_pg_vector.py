@@ -165,6 +165,13 @@ class ExtendedPgVector(PGVector):
             operator = "$eq"
             filter_value = value
 
+        if filter_value is None and operator == "$eq":
+            # Legacy-rows filter: cmetadata->>'field' IS NULL matches rows where the
+            # key is absent OR JSON null. Needed by /query's legacy fallback so
+            # foreign-namespace rows cannot fill the top-k (card #278).
+            return self.EmbeddingStore.cmetadata[field].astext.is_(None)
+        if filter_value is None and operator == "$ne":
+            return self.EmbeddingStore.cmetadata[field].astext.is_not(None)
         if operator == "$eq":
             return self.EmbeddingStore.cmetadata[field].astext == str(filter_value)
         elif operator == "$ne":
@@ -218,6 +225,60 @@ class ExtendedPgVector(PGVector):
             result = session.execute(stmt)
             session.commit()
             return result.rowcount or 0
+
+    def replace_file_batch(
+        self,
+        file_id: str,
+        user_id: str,
+        documents: list[Document],
+        ids: Optional[list[str]] = None,
+    ) -> list[str]:
+        """Atomically swaps this namespace's batch for the file: deletes the stored
+        rows and inserts the new ones in a SINGLE transaction.
+
+        Why: deleting first and inserting afterwards (two commits) loses the previous
+        vectors when the embedding provider or the insert fails mid-way. Here any
+        failure — provider error, constraint violation — rolls the whole transaction
+        back and the old batch survives untouched. Rows for the same file_id in other
+        namespaces are never touched.
+        """
+        texts = [doc.page_content for doc in documents]
+        metadatas = [doc.metadata or {} for doc in documents]
+        if ids is None:
+            ids = [file_id] * len(documents)
+        if len(ids) != len(documents):
+            raise ValueError("ids and documents must have the same length")
+
+        with Session(self._bind) as session:
+            collection = self.get_collection(session)
+            if not collection:
+                raise ValueError("Collection not found")
+            # Embed BEFORE touching the stored rows: a provider failure raises with
+            # the old batch still committed and intact.
+            embeddings = self.embedding_function.embed_documents(texts)
+            session.execute(
+                delete(self.EmbeddingStore).where(
+                    self.EmbeddingStore.collection_id == collection.uuid,
+                    self.EmbeddingStore.custom_id == file_id,
+                    self.EmbeddingStore.cmetadata["user_id"].astext == user_id,
+                )
+            )
+            rows = [
+                self.EmbeddingStore(
+                    embedding=embedding,
+                    document=text,
+                    cmetadata=metadata,
+                    custom_id=custom_id,
+                    collection_id=collection.uuid,
+                )
+                for text, metadata, embedding, custom_id in zip(
+                    texts, metadatas, embeddings, ids
+                )
+            ]
+            session.bulk_save_objects(rows)
+            # Single commit for delete + insert: the swap is atomic.
+            session.commit()
+        return ids
 
     def get_filtered_ids(self, ids: list[str]) -> list[str]:
         with Session(self._bind) as session:
