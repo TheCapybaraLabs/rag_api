@@ -25,6 +25,18 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from functools import lru_cache
 import asyncio
 
+try:  # sqlalchemy is a hard dependency of the pgvector stores
+    from sqlalchemy.exc import IntegrityError
+except ImportError:  # pragma: no cover - non-pgvector deployments
+    IntegrityError = None
+
+try:  # asyncpg backs the DSN-based paths; optional at import time here
+    import asyncpg as _asyncpg
+
+    _UNIQUE_VIOLATION_TYPES = (getattr(_asyncpg, "UniqueViolationError", ()),)
+except ImportError:  # pragma: no cover
+    _UNIQUE_VIOLATION_TYPES = ()
+
 if TYPE_CHECKING:
     from app.services.vector_store.async_pg_vector import AsyncPgVector
     from app.services.vector_store.atlas_mongo_vector import AtlasMongoVector
@@ -378,48 +390,85 @@ async def query_embeddings_by_file_id(
     try:
         embedding = get_cached_query_embedding(body.query)
 
-        if isinstance(vector_store, AsyncPgVector):
-            documents = await vector_store.asimilarity_search_with_score_by_vector(
-                embedding,
-                k=body.k,
-                filter={"file_id": {"$eq": body.file_id}},
-                executor=request.app.state.thread_pool,
-            )
-        else:
-            documents = vector_store.similarity_search_with_score_by_vector(
-                embedding, k=body.k, filter={"file_id": {"$eq": body.file_id}}
-            )
+        # The namespace decides authorization, so it must constrain the vector search
+        # itself — filtering only by file_id lets an old batch embedded under another
+        # namespace occupy the top-k and leak across agents/users. Candidate order keeps
+        # the legacy fallback: agent-scoped uploads first, the requesting user second.
+        namespace_candidates = [user_authorized]
+        if (
+            body.entity_id
+            and hasattr(request.state, "user")
+            and request.state.user.get("id") != body.entity_id
+        ):
+            namespace_candidates.append(request.state.user.get("id"))
 
-        documents = _apply_distance_threshold(documents)
+        documents = []
+        for candidate in namespace_candidates:
+            namespace_filter = {
+                "file_id": {"$eq": body.file_id},
+                "user_id": {"$eq": candidate},
+            }
+            if isinstance(vector_store, AsyncPgVector):
+                documents = await vector_store.asimilarity_search_with_score_by_vector(
+                    embedding,
+                    k=body.k,
+                    filter=namespace_filter,
+                    executor=request.app.state.thread_pool,
+                )
+            else:
+                documents = vector_store.similarity_search_with_score_by_vector(
+                    embedding, k=body.k, filter=namespace_filter
+                )
+            documents = _apply_distance_threshold(documents)
+            if documents:
+                break
+
+        # Legacy rows may predate the user_id metadata: only when no namespace-restricted
+        # search returned anything do we fall back to a legacy-only query, filtered at
+        # the store to user_id IS NULL (key absent or JSON null) so foreign-namespace
+        # rows cannot fill the top-k and evict the legacy hits.
+        if not documents:
+            legacy_filter = {
+                "file_id": {"$eq": body.file_id},
+                "user_id": {"$eq": None},  # astext IS NULL: legacy rows only
+            }
+            if isinstance(vector_store, AsyncPgVector):
+                documents = await vector_store.asimilarity_search_with_score_by_vector(
+                    embedding,
+                    k=body.k,
+                    filter=legacy_filter,
+                    executor=request.app.state.thread_pool,
+                )
+            else:
+                documents = vector_store.similarity_search_with_score_by_vector(
+                    embedding, k=body.k, filter=legacy_filter
+                )
+            documents = _apply_distance_threshold(documents)
 
         if not documents:
             return authorized_documents
 
-        document, score = documents[0]
-        doc_metadata = document.metadata
-        doc_user_id = doc_metadata.get("user_id")
-
-        if doc_user_id is None or doc_user_id == user_authorized:
-            authorized_documents = documents
-        else:
-            # If using entity_id and access denied, try again with user's actual ID
-            if body.entity_id and hasattr(request.state, "user"):
-                user_authorized = request.state.user.get("id")
-                if doc_user_id == user_authorized:
-                    authorized_documents = documents
-                else:
-                    if body.entity_id == doc_user_id:
-                        logger.warning(
-                            f"Entity ID {body.entity_id} matches document user_id but user {user_authorized} is not authorized"
-                        )
-                    else:
-                        logger.warning(
-                            f"Access denied for both entity ID {body.entity_id} and user {user_authorized} to document with user_id {doc_user_id}"
-                        )
-            else:
-                logger.warning(
-                    f"Unauthorized access attempt by user {user_authorized} to a document with user_id {doc_user_id}"
-                )
+        # Validated per result: a mixed batch (older store behavior, concurrent
+        # re-embedding) must not pass because its first hit was authorized.
+        # ``None`` stays allowed as the *explicit, documented* legacy case: rows
+        # written before user_id existed carry no namespace at all. The empty
+        # string is NEVER allowed — store_data_in_vector_db historically defaulted
+        # user_id to "", so ''-namespace rows are of ambiguous ownership and must
+        # not become readable by anyone who knows the file_id.
+        allowed_namespaces = set(namespace_candidates)
+        authorized_documents = [
+            (document, score)
+            for document, score in documents
+            if document.metadata.get("user_id") in (None, *allowed_namespaces)
+        ]
+        denied = len(documents) - len(authorized_documents)
+        if denied:
+            logger.warning(
+                "Access denied for %d document(s) with file_id %s outside namespaces %s",
+                denied,
+                body.file_id,
+                sorted(allowed_namespaces),
+            )
 
         return authorized_documents
 
@@ -446,6 +495,7 @@ async def _process_documents_async_pipeline(
     file_id: str,
     vector_store: "AsyncPgVector",
     executor: "ThreadPoolExecutor",
+    user_id: Optional[str] = None,
 ) -> List[str]:
     """
     Process documents using async producer-consumer pattern for batched embedding and insertion.
@@ -455,6 +505,9 @@ async def _process_documents_async_pipeline(
         file_id: Unique identifier for the file being processed
         vector_store: AsyncPgVector instance for document storage
         executor: ThreadPoolExecutor for concurrent operations
+        user_id: Namespace of this ingestion. When present, the failure rollback is
+            scoped to (file_id, user_id) instead of the bare file_id, which would also
+            delete other namespaces' copies of the same shared record.
 
     Returns:
         List of document IDs that were successfully inserted
@@ -591,14 +644,29 @@ async def _process_documents_async_pipeline(
                     consumer_task, producer_task, return_exceptions=True
                 )
 
-        # Attempt rollback only if we inserted something
-        if all_ids:
+        # Attempt rollback only if we inserted something — and NEVER after a unique
+        # violation: there the losing request either inserted nothing (every batch
+        # collides with the winner's identity) or its partial rows are indistinguishable
+        # from the winner's. Deleting by file_id here would wipe the winning request's
+        # rows — and, unscoped, every other namespace's copy (card #278 race → data loss).
+        if all_ids and not _is_unique_violation(e):
             try:
                 logger.warning("Performing rollback of file %s", file_id)
-                await vector_store.delete(ids=[file_id], executor=executor)
+                scoped_delete = getattr(vector_store, "delete_file_batch", None)
+                if user_id is not None and callable(scoped_delete):
+                    await vector_store.delete_file_batch(file_id, user_id, executor=executor)
+                else:
+                    await vector_store.delete(ids=[file_id], executor=executor)
                 logger.info("Rollback completed for file %s", file_id)
             except Exception as cleanup_error:
                 logger.error("Rollback failed for file %s: %s", file_id, cleanup_error)
+        elif _is_unique_violation(e):
+            logger.warning(
+                "Unique chunk identity violated for file %s (concurrent ingestion of "
+                "the same batch?); skipping rollback so the winning request's rows "
+                "survive",
+                file_id,
+            )
 
         # Re-raise the original error
         raise
@@ -608,7 +676,8 @@ async def _process_documents_batched_sync(
     documents: List[Document],
     file_id: str,
     vector_store: Union["PgVector", "AtlasMongoVector"],
-    executor: "ThreadPoolExecutor",
+    executor: Optional["ThreadPoolExecutor"],
+    user_id: Optional[str] = None,
 ) -> List[str]:
     """
     Process documents in batches using synchronous vector store operations.
@@ -666,15 +735,37 @@ async def _process_documents_batched_sync(
         except Exception as batch_error:
             logger.error("Batch %d failed: %s", batch_idx + 1, batch_error)
 
-            # Rollback entire file from vector store
+            # A unique violation means a concurrent request stored this exact chunk
+            # identity first. Our rows are indistinguishable from the winner's, so a
+            # delete — even namespace-scoped — would wipe the winner's fresh batch
+            # (card #278 race → data loss). Leave the stored rows alone and re-raise.
+            if _is_unique_violation(batch_error):
+                logger.warning(
+                    "Unique chunk identity violated for file %s namespace %s "
+                    "(concurrent ingestion of the same batch?); no rollback so the "
+                    "winning request's rows survive",
+                    file_id,
+                    user_id,
+                )
+                raise batch_error
+
+            # Rollback the partial batch. Scoped to this namespace when possible: a
+            # delete by bare file_id would also remove other agents' copies of the
+            # same shared record, and older batches still needed for fallback.
             if (
                 all_ids
             ):  # any batch succeeded (i.e., any chunks for this file were inserted)
                 logger.warning("Rolling back file %s due to batch failure", file_id)
                 try:
-                    await loop.run_in_executor(
-                        executor, lambda: vector_store.delete(ids=[file_id])
-                    )
+                    scoped_delete = getattr(vector_store, "delete_file_batch", None)
+                    if user_id is not None and callable(scoped_delete):
+                        await loop.run_in_executor(
+                            executor, lambda: scoped_delete(file_id, user_id)
+                        )
+                    else:
+                        await loop.run_in_executor(
+                            executor, lambda: vector_store.delete(ids=[file_id])
+                        )
                     logger.info("Rollback completed for file %s", file_id)
                 except Exception as rollback_error:
                     logger.error(
@@ -690,15 +781,63 @@ def generate_digest(page_content: str) -> str:
     return hashlib.md5(page_content.encode("utf-8", "ignore")).hexdigest()
 
 
+def _is_unique_violation(exc: BaseException) -> bool:
+    """True when ``exc`` is (or wraps) a PostgreSQL unique-constraint violation.
+
+    The concurrent-ingestion race of card #278 ends here: with the partial unique
+    index active, the losing request's insert raises instead of duplicating rows.
+    Detecting it lets the rollback paths refuse to delete by file_id — the rows now
+    stored may belong to the winning request (or to other namespaces), and deleting
+    them turns a benign race into data loss.
+
+    A detecção é restrita à violação UNIQUE (pgcode/sqlstate 23505,
+    UniqueViolationError ou a mensagem literal do Postgres). Qualquer OUTRO
+    IntegrityError (NOT NULL, FK, CHECK) não é corrida perdida: o lote falhou de
+    verdade e precisa do rollback normal — tratá-lo como corrida pularia o
+    rollback e deixaria o arquivo meio ingerido.
+    """
+    seen = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        # A cadeia DBAPI do SQLAlchemy expõe o erro do driver em .orig; o próprio
+        # current pode já ser o erro do driver (asyncpg) — checar os dois.
+        for candidate in (current, getattr(current, "orig", None)):
+            if candidate is None:
+                continue
+            if (
+                getattr(candidate, "pgcode", None) == "23505"
+                or getattr(candidate, "sqlstate", None) == "23505"
+            ):
+                return True
+            if _UNIQUE_VIOLATION_TYPES and isinstance(
+                candidate, _UNIQUE_VIOLATION_TYPES
+            ):
+                return True
+        if "duplicate key value violates unique constraint" in str(current).lower():
+            return True
+        orig = getattr(current, "orig", None)
+        current = orig if orig is not None else getattr(current, "__cause__", None)
+    return False
+
+
 def _prepare_documents_sync(
     data: Iterable[Document],
     file_id: str,
     user_id: str,
     clean_content: bool,
+    filename: Optional[str] = None,
 ) -> List[Document]:
     """
     Synchronous document preparation - runs in executor to avoid blocking event loop.
     Handles text splitting, cleaning, and metadata preparation.
+
+    ``filename`` is the logical upload name (multipart ``filename``): it is persisted as
+    the canonical origin in ``metadata.filename`` and ``metadata.source``, so citations
+    never surface the server's unique temp path (which carries its own UUID suffix on
+    top of any provisioner's temp name). ``chunk_index`` records the chunk's position
+    within this upload; together with file_id and user_id it forms the chunk identity
+    the dedup logic and the unique index (see migrations/) are built on.
     """
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
@@ -711,18 +850,22 @@ def _prepare_documents_sync(
             doc.page_content = clean_text(doc.page_content)
 
     # Preparing documents with page content and metadata for insertion.
-    return [
-        Document(
-            page_content=doc.page_content,
-            metadata={
-                "file_id": file_id,
-                "user_id": user_id,
-                "digest": generate_digest(doc.page_content),
-                **(doc.metadata or {}),
-            },
-        )
-        for doc in documents
-    ]
+    prepared = []
+    for chunk_index, doc in enumerate(documents):
+        metadata = {
+            "file_id": file_id,
+            "user_id": user_id,
+            "digest": generate_digest(doc.page_content),
+            **(doc.metadata or {}),
+        }
+        if filename:
+            # Logical name wins over the loader's transport path (last write, cannot be
+            # clobbered by loader metadata above).
+            metadata["filename"] = filename
+            metadata["source"] = filename
+        metadata["chunk_index"] = chunk_index
+        prepared.append(Document(page_content=doc.page_content, metadata=metadata))
+    return prepared
 
 
 async def store_data_in_vector_db(
@@ -731,7 +874,8 @@ async def store_data_in_vector_db(
     user_id: str = "",
     clean_content: bool = False,
     executor=None,
-) -> bool:
+    filename: Optional[str] = None,
+) -> dict:
     # Run document preparation in executor to avoid blocking the event loop
     loop = asyncio.get_running_loop()
     docs = await loop.run_in_executor(
@@ -741,9 +885,69 @@ async def store_data_in_vector_db(
         file_id,
         user_id,
         clean_content,
+        filename,
     )
 
+    # Digests of what we are about to write — computed once, also used by the
+    # unique-violation handler below to recognize "a concurrent request stored
+    # exactly this content".
+    incoming_digests = sorted(
+        doc.metadata.get("digest", "") for doc in docs if doc.metadata
+    )
+
+    # Store capabilities, resolved before the try so the except handler can rely
+    # on them regardless of where the failure happened.
+    get_batch = getattr(vector_store, "get_file_batch_digests", None)
+    replace_batch = getattr(vector_store, "replace_file_batch", None)
+    delete_batch = getattr(vector_store, "delete_file_batch", None)
+
     try:
+        # Idempotent ingestion: a re-upload (retry, reindex, concurrent request) of the
+        # same content under the same file_id and namespace must not add rows. Compare
+        # the incoming chunk digests with the stored batch; skip when equal, and swap
+        # the batch atomically (single transaction: delete old + insert new) when the
+        # content changed — a failure mid-swap leaves the previous vectors in place.
+        if callable(get_batch):
+            existing_digests = await get_batch(file_id, user_id, executor=executor)
+            if existing_digests is not None:
+                if sorted(existing_digests) == incoming_digests:
+                    logger.info(
+                        "File %s already embedded for namespace %s with identical content; skipping re-embed",
+                        file_id,
+                        user_id,
+                    )
+                    return {
+                        "message": "File already embedded with identical content",
+                        "ids": [],
+                        "deduplicated": True,
+                    }
+                if callable(replace_batch):
+                    ids = await replace_batch(
+                        file_id, user_id, docs, executor=executor
+                    )
+                    logger.info(
+                        "Atomically replaced batch for file %s in namespace %s (%d chunks)",
+                        file_id,
+                        user_id,
+                        len(ids),
+                    )
+                    return {
+                        "message": "Documents replaced successfully",
+                        "ids": ids,
+                        "replaced": True,
+                    }
+                if callable(delete_batch):
+                    # Legacy stores without the atomic swap: fall back to the old
+                    # delete-then-insert (NOT atomic — kept only for stores that
+                    # lack replace_file_batch).
+                    removed = await delete_batch(file_id, user_id, executor=executor)
+                    logger.info(
+                        "Replacing batch for file %s in namespace %s (%d stored rows)",
+                        file_id,
+                        user_id,
+                        removed,
+                    )
+
         if EMBEDDING_BATCH_SIZE <= 0:
             # synchronously embed the file and insert into vector store in one go
             if isinstance(vector_store, AsyncPgVector):
@@ -759,17 +963,37 @@ async def store_data_in_vector_db(
 
             if isinstance(vector_store, AsyncPgVector):
                 ids = await _process_documents_async_pipeline(
-                    docs, file_id, vector_store, executor
+                    docs, file_id, vector_store, executor, user_id=user_id
                 )
             else:
                 # Fallback to batched processing for sync vector stores
                 ids = await _process_documents_batched_sync(
-                    docs, file_id, vector_store, executor
+                    docs, file_id, vector_store, executor, user_id=user_id
                 )
 
         return {"message": "Documents added successfully", "ids": ids}
 
     except Exception as e:
+        # Concurrent ingestion of the same batch: the loser hits the unique chunk
+        # identity. If the stored batch now equals what we tried to write, the
+        # winner wrote exactly our content — report the idempotent outcome instead
+        # of an error. Either way, no rows are deleted here.
+        if _is_unique_violation(e) and callable(get_batch):
+            try:
+                stored = await get_batch(file_id, user_id, executor=executor)
+            except Exception:
+                stored = None
+            if stored is not None and sorted(stored) == incoming_digests:
+                logger.info(
+                    "File %s was embedded concurrently for namespace %s with identical content; reporting deduplicated",
+                    file_id,
+                    user_id,
+                )
+                return {
+                    "message": "File already embedded with identical content",
+                    "ids": [],
+                    "deduplicated": True,
+                }
         logger.error(
             "Failed to store data in vector DB | File ID: %s | User ID: %s | Error: %s | Traceback: %s",
             file_id,
@@ -815,6 +1039,7 @@ async def embed_local_file(
             user_id,
             clean_content=file_ext == "pdf",
             executor=request.app.state.thread_pool,
+            filename=document.filename,
         )
 
         if result:
@@ -864,6 +1089,7 @@ async def embed_file(
     response_status = True
     response_message = "File processed successfully."
     known_type = None
+    deduplicated = False
 
     user_id = get_user_id(request, entity_id)
     validated_file_path = _make_unique_temp_path(user_id, file.filename)
@@ -891,6 +1117,7 @@ async def embed_file(
             user_id=user_id,
             clean_content=file_ext == "pdf",
             executor=request.app.state.thread_pool,
+            filename=file.filename,
         )
 
         if not result:
@@ -910,6 +1137,8 @@ async def embed_file(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                     detail="An unspecified error occurred.",
                 )
+        else:
+            deduplicated = result.get("deduplicated", False)
     except HTTPException as http_exc:
         response_status = False
         response_message = f"HTTP Exception: {http_exc.detail}"
@@ -940,6 +1169,7 @@ async def embed_file(
         "file_id": file_id,
         "filename": file.filename,
         "known_type": known_type,
+        "deduplicated": deduplicated,
     }
 
 
@@ -1027,6 +1257,7 @@ async def embed_file_upload(
             user_id,
             clean_content=file_ext == "pdf",
             executor=request.app.state.thread_pool,
+            filename=uploaded_file.filename,
         )
 
         if not result:
