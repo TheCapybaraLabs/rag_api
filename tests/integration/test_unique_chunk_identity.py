@@ -20,6 +20,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.services.vector_store.async_pg_vector import AsyncPgVector
 from app.services.vector_store.extended_pg_vector import ExtendedPgVector
 from langchain_community.vectorstores.pgvector import _get_embedding_collection_store
 
@@ -52,8 +53,13 @@ def _insert_embedding(
     document,
     custom_id=None,
     with_new_metadata=True,
+    digest=None,
 ):
-    meta = {"file_id": file_id, "user_id": user_id, "digest": f"d{chunk_index}"}
+    meta = {
+        "file_id": file_id,
+        "user_id": user_id,
+        "digest": digest if digest is not None else f"d{chunk_index}",
+    }
     if with_new_metadata:
         meta["chunk_index"] = chunk_index
     conn.execute(
@@ -314,6 +320,108 @@ def test_unique_violation_race_preserves_winning_rows(engine, collection_id):
         with engine.begin() as cleanup:
             cleanup.execute(text("DROP INDEX IF EXISTS uq_langchain_pg_embedding_chunk_identity"))
             cleanup.execute(text("DELETE FROM langchain_pg_embedding WHERE cmetadata->>'file_id' = 'f-race'"))
+
+
+class _RaceLoserStore(AsyncPgVector):
+    """Store do PERDEDOR da corrida sobre o banco real.
+
+    A primeira consulta de digests devolve None (o estado que o perdedor enxerga
+    antes do commit do vencedor); as seguintes delegam ao store real. O insert vai
+    ao banco de verdade e bate no índice único — a corrida não é simulada com mock.
+    """
+
+    def __init__(self, real_store):
+        self._real = real_store
+        self.consultas = 0
+        self.deletes = 0
+
+    async def get_file_batch_digests(self, file_id, user_id, executor=None):
+        self.consultas += 1
+        if self.consultas == 1:
+            return None
+        return self._real.get_file_batch_digests(file_id, user_id)
+
+    async def aadd_documents(self, documents, ids=None, executor=None, **kwargs):
+        return self._real.add_documents(documents, ids=ids)
+
+    async def delete_file_batch(self, file_id, user_id, executor=None):
+        self.deletes += 1
+        return self._real.delete_file_batch(file_id, user_id)
+
+
+def test_store_data_in_vector_db_race_reports_deduplicated_and_skips_rollback(
+    engine, collection_id, monkeypatch
+):
+    """Rodada 3 (sugestão): o caminho app INTEIRO — store_data_in_vector_db — sob
+    corrida real (índice único ativo, linhas do vencedor no banco): o perdedor
+    reconhece o lote do vencedor, responde deduplicated e NÃO apaga nada."""
+    import asyncio
+
+    from app.routes import document_routes
+
+    store = _replace_store(engine, collection_id)
+    race_store = _RaceLoserStore(store)
+
+    conn = engine.connect()
+    trans = conn.begin()
+    try:
+        conn.exec_driver_sql(_executable_sql(MIGRATION.read_text()))
+        textos = ["conteudo-raca-a", "conteudo-raca-b"]
+        for i, texto in enumerate(textos):
+            _insert_embedding(
+                conn,
+                collection_id,
+                file_id="f-app-race",
+                user_id="u1",
+                chunk_index=i,
+                document=texto,
+                digest=hashlib.md5(texto.encode()).hexdigest(),
+            )
+        trans.commit()
+        trans = conn.begin()
+
+        print("DEBUG vector_store global:", type(document_routes.vector_store)); print("DEBUG race_store:", type(race_store)); print("DEBUG _real:", type(getattr(race_store, "_real", None)), "| get_file_batch_digests de _real:", getattr(type(getattr(race_store, "_real", None)), "get_file_batch_digests", None)); print("DEBUG CollectionStore em _real:", hasattr(getattr(race_store, "_real", None), "CollectionStore"));
+        monkeypatch.setattr(document_routes, "EMBEDDING_BATCH_SIZE", 0)
+        # store_data_in_vector_db usa o vector_store GLOBAL do módulo de rotas —
+        # o perdedor precisa estar lá para a corrida exercitar o caminho app real.
+        monkeypatch.setattr(document_routes, "vector_store", race_store)
+        entrada = [Document(page_content=t) for t in textos]
+        resultado = asyncio.run(
+            document_routes.store_data_in_vector_db(
+                entrada, "f-app-race", "u1", executor=None
+            )
+        )
+
+        assert resultado["deduplicated"] is True
+        assert race_store.consultas == 2, "pré-checagem + reconferência pós-corrida"
+        assert race_store.deletes == 0, "rollback pulado: nada é apagado na corrida"
+
+        sobreviventes = conn.execute(
+            text(
+                "SELECT cmetadata->>'user_id', cmetadata->>'digest' "
+                "FROM langchain_pg_embedding "
+                "WHERE cmetadata->>'file_id' = 'f-app-race' "
+                "ORDER BY cmetadata->>'chunk_index'"
+            )
+        ).all()
+        assert sobreviventes == [
+            ("u1", hashlib.md5(b"conteudo-raca-a").hexdigest()),
+            ("u1", hashlib.md5(b"conteudo-raca-b").hexdigest()),
+        ], "linhas do VENCEDOR permanecem, intactas"
+    finally:
+        if trans.is_active:
+            trans.rollback()
+        conn.close()
+        with engine.begin() as cleanup:
+            cleanup.execute(
+                text("DROP INDEX IF EXISTS uq_langchain_pg_embedding_chunk_identity")
+            )
+            cleanup.execute(
+                text(
+                    "DELETE FROM langchain_pg_embedding "
+                    "WHERE cmetadata->>'file_id' = 'f-app-race'"
+                )
+            )
 
 
 def test_filter_eq_none_matches_only_legacy_rows(engine, collection_id):

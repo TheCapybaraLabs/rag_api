@@ -13,7 +13,9 @@ Regras da casa (não negociáveis):
     no manifesto do dry-run — nunca um reagrupamento refeito na hora.
   * O agrupamento é SEMPRE por namespace (user_id): cópias legítimas do mesmo
     chunk entre agentes são preservadas. `--no-by-namespace` existe só para
-    inventário e é RECUSADO com --execute.
+    inventário e é RECUSADO com --execute — e o manifesto grava `by_namespace`:
+    --execute também RECUSA manifesto gerado sem namespace (ou sem o campo,
+    de versão anterior do script).
   * A posição do chunk (chunk_index) entra no agrupamento: textos repetidos na
     mesma página em posições distintas são chunks distintos, não duplicatas.
   * Mantém-se a linha mais antiga (menor ctid ≈ ordem física de inserção), não
@@ -265,6 +267,7 @@ def write_manifest(
         "schema": schema,
         "colecao": collection,
         "escopo_file_ids": file_ids if file_ids else "ALL",
+        "by_namespace": bool(by_namespace),
         "agrupamento": agrupamento,
         "criterio_manter": KEEP_RULE_DESCRIPTION,
         "total_linhas_antes": total_antes,
@@ -275,7 +278,13 @@ def write_manifest(
 
 
 def load_manifest_remover_uuids(manifest_path: Path) -> tuple[list[str], dict]:
-    """Lê os remover_uuids APROVADOS no manifesto do dry-run."""
+    """Lê os remover_uuids APROVADOS no manifesto do dry-run.
+
+    O manifesto é a ÚNICA fonte de exclusão — e ele tem de provar COMO foi
+    gerado: exige `by_namespace: true`, a descrição exata do agrupamento padrão
+    e um único namespace consistente por grupo. Manifestos entre agentes ou de
+    versões anteriores são recusados antes de qualquer conexão ao banco.
+    """
     if not manifest_path.exists():
         raise SystemExit(
             f"Manifesto não encontrado: {manifest_path}. Rode o dry-run antes."
@@ -286,8 +295,26 @@ def load_manifest_remover_uuids(manifest_path: Path) -> tuple[list[str], dict]:
         raise SystemExit(f"Manifesto inválido ({manifest_path}): {exc}")
     if manifesto.get("card") != "278-citacoes-duplicadas":
         raise SystemExit(f"Manifesto não é do card #278: {manifest_path}")
+    if manifesto.get("by_namespace") is not True:
+        raise SystemExit(
+            "Recusado: o manifesto não registra agrupamento por namespace "
+            f"(by_namespace={manifesto.get('by_namespace')!r}). Ele foi gerado com "
+            "--no-by-namespace (só inventário) ou por versão anterior do script; "
+            "aplicá-lo fundiria cópias legítimas do mesmo chunk entre agentes. "
+            "Rode o dry-run de novo com o agrupamento padrão (por namespace)."
+        )
+    if manifesto.get("agrupamento") != GROUPING_DESCRIPTION:
+        raise SystemExit(
+            "Recusado: agrupamento do manifesto não corresponde ao padrão por "
+            "namespace. Rode o dry-run de novo com o agrupamento padrão."
+        )
     removidos: list[str] = []
     for g in manifesto.get("grupos", []):
+        if "namespace" not in g or g.get("namespaces_presentes") != [g["namespace"]]:
+            raise SystemExit(
+                "Recusado: grupo do manifesto sem namespace único e consistente "
+                f"(file_id={g.get('file_id')!r}). Nenhum uuid será apagado."
+            )
         removidos.extend(g.get("remover_uuids", []))
     if not removidos:
         raise SystemExit("Manifesto não contém candidatos (remover_uuids vazio).")
@@ -312,32 +339,52 @@ async def execute_manifest(
     conn,
     schema: str | None,
     remover_uuids: list[str],
+    manifest_groups: list[dict],
 ) -> tuple[str, int, int, list[str]]:
     """Snapshot + delete dos uuids do manifesto, numa ÚNICA transação.
 
-    Verifica antes quais ainda existem e apaga EXATAMENTE esses (nunca um
-    reagrupamento vivo). Retorna (snapshot_table, snap_count, removidos, ausentes).
+    Verifica e bloqueia os manter_uuid antes de qualquer exclusão; keeper ausente
+    recusa a execução inteira. Apaga EXATAMENTE os candidatos ainda presentes
+    (nunca um reagrupamento vivo). Retorna (snapshot_table, snap_count, removidos,
+    ausentes).
     """
-    # 1. Verificação: quais uuids aprovados ainda existem?
-    presentes = await conn.fetch(
-        f"SELECT uuid FROM {qualify(EMBEDDING_TABLE, None)} WHERE uuid = ANY($1::uuid[])",
-        remover_uuids,
-    )
-    presentes_ids = [str(r["uuid"]) for r in presentes]
-    ausentes = sorted(set(remover_uuids) - set(presentes_ids))
-    if ausentes:
-        print(
-            f"Aviso: {len(ausentes)} uuid(s) do manifesto não existem mais "
-            "(já removidos?):\n  " + "\n  ".join(ausentes[:10])
-        )
-    if not presentes_ids:
-        return "", 0, 0, ausentes
-
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    snapshot_table = f"card278_backup_{ts}"
-
-    # 2. Snapshot + delete na MESMA transação: ou os dois acontecem, ou nenhum.
     async with conn.transaction():
+        # O lock preserva os keepers até o commit do snapshot/delete.
+        manter_uuids = [g.get("manter_uuid") for g in manifest_groups]
+        keepers = await conn.fetch(
+            f"SELECT uuid FROM {qualify(EMBEDDING_TABLE, schema)} "
+            "WHERE uuid = ANY($1::uuid[]) FOR KEY SHARE",
+            manter_uuids,
+        )
+        keepers_ids = {str(r["uuid"]) for r in keepers}
+        for g in manifest_groups:
+            if g.get("manter_uuid") not in keepers_ids:
+                raise SystemExit(
+                    f"Recusado: manter_uuid {g.get('manter_uuid')!r} ausente "
+                    f"(file_id={g.get('file_id')!r}, namespace={g.get('namespace')!r}). "
+                    "Nada foi apagado. Rode o dry-run de novo."
+                )
+
+        # Quais uuids aprovados ainda existem?
+        presentes = await conn.fetch(
+            f"SELECT uuid FROM {qualify(EMBEDDING_TABLE, None)} "
+            "WHERE uuid = ANY($1::uuid[])",
+            remover_uuids,
+        )
+        presentes_ids = [str(r["uuid"]) for r in presentes]
+        ausentes = sorted(set(remover_uuids) - set(presentes_ids))
+        if ausentes:
+            print(
+                f"Aviso: {len(ausentes)} uuid(s) do manifesto não existem mais "
+                "(já removidos?):\n  " + "\n  ".join(ausentes[:10])
+            )
+        if not presentes_ids:
+            return "", 0, 0, ausentes
+
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        snapshot_table = f"card278_backup_{ts}"
+
+        # Snapshot + delete: ou os dois acontecem, ou nenhum.
         result = await conn.execute(
             f"""
             CREATE TABLE {qualify(snapshot_table, schema)} AS
@@ -427,6 +474,12 @@ async def run_execute(args: argparse.Namespace) -> int:
     print(f"Agrupamento: {manifesto.get('agrupamento')}")
     print(f"Critério de manutenção: {manifesto.get('criterio_manter')}")
     print(f"Candidatos aprovados no manifesto: {len(remover_uuids)}")
+    if manifesto.get("schema") != args.schema:
+        print(
+            f"Aviso: schema do manifesto ({manifesto.get('schema')!r}) diverge do "
+            f"--schema alvo ({args.schema!r}). O snapshot/delete rodam no schema "
+            "ALVO — confira antes de confirmar."
+        )
 
     if not args.yes:
         resposta = input(
@@ -440,7 +493,7 @@ async def run_execute(args: argparse.Namespace) -> int:
     conn = await connect(args.dsn, args.schema)
     try:
         snapshot_table, snap_count, removidos, ausentes = await execute_manifest(
-            conn, args.schema, remover_uuids
+            conn, args.schema, remover_uuids, manifesto["grupos"]
         )
         if not snapshot_table:
             print("Nenhum uuid do manifesto existe mais. Nada a fazer.")

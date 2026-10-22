@@ -20,6 +20,8 @@ from pathlib import Path
 import asyncpg
 import pytest
 
+from scripts.cleanup_duplicate_vectors import GROUPING_DESCRIPTION
+
 pytestmark = pytest.mark.integration
 
 REPO = Path(__file__).resolve().parents[2]
@@ -389,6 +391,120 @@ class TestExecuteAppliesManifest:
 
 
 class TestExecuteRefusals:
+    @pytest.mark.parametrize(
+        "invalid_part",
+        ["reviewer_manifest", "agrupamento", "namespace", "namespaces_presentes"],
+    )
+    def test_execute_refuses_cross_namespace_manifest_without_cli_flag(
+        self, tmp_path, invalid_part
+    ):
+        """Reprodução do revisor: uuids reais de agentA/agentB no mesmo grupo.
+
+        by_namespace=True não basta: cada outra evidência insegura deve recusar
+        o arquivo por si só, mesmo sem --no-by-namespace na CLI.
+        """
+        manifesto = tmp_path / "manifesto.json"
+        asyncio.run(
+            _insert_rows(
+                [
+                    ("tenant-doc", "agentA", 0, 0, "MESMO", "/tmp/a.pdf"),
+                    ("tenant-doc", "agentB", 0, 0, "MESMO", "/tmp/b.pdf"),
+                ]
+            )
+        )
+
+        async def _ids_by_namespace():
+            conn = await _connect()
+            try:
+                rows = await conn.fetch(
+                    "SELECT uuid, cmetadata->>'user_id' AS namespace "
+                    "FROM langchain_pg_embedding"
+                )
+                return {row["namespace"]: str(row["uuid"]) for row in rows}
+            finally:
+                await conn.close()
+
+        ids = asyncio.run(_ids_by_namespace())
+        group = {
+            "file_id": "tenant-doc",
+            "namespace": "agentA",
+            "namespaces_presentes": ["agentA"],
+            "manter_uuid": ids["agentA"],
+            "remover_uuids": [ids["agentB"]],
+        }
+        grouping = GROUPING_DESCRIPTION
+        if invalid_part in ("reviewer_manifest", "agrupamento"):
+            grouping = "file_id+page+chunk_index+md5(document) (SEM namespace — só inventário!)"
+        if invalid_part in ("reviewer_manifest", "namespace"):
+            del group["namespace"]
+        if invalid_part in ("reviewer_manifest", "namespaces_presentes"):
+            group["namespaces_presentes"] = ["agentA", "agentB"]
+        manifesto.write_text(
+            json.dumps(
+                {
+                    "card": "278-citacoes-duplicadas",
+                    "by_namespace": True,
+                    "agrupamento": grouping,
+                    "grupos": [group],
+                }
+            )
+        )
+        approved = manifesto.read_bytes()
+
+        run = _run_script("--manifesto", str(manifesto), "--execute", "--yes")
+
+        assert run.returncode != 0
+        assert "Recusado" in run.stderr and "namespace" in run.stderr
+        assert asyncio.run(_ids_by_namespace()) == ids, "ambas as cópias devem sobreviver"
+        assert manifesto.read_bytes() == approved
+        assert not manifesto.with_suffix(".json.execucao.json").exists()
+
+    def test_execute_refuses_missing_keeper_without_deleting_any_group(self, tmp_path):
+        manifesto = tmp_path / "manifesto.json"
+        asyncio.run(
+            _insert_rows(
+                [
+                    ("safe-doc", "agentA", 0, 0, "MESMO", f"/tmp/a{i}.pdf")
+                    for i in range(3)
+                ]
+                + [
+                    ("stale-doc", "agentB", 0, 0, "OUTRO", f"/tmp/b{i}.pdf")
+                    for i in range(2)
+                ]
+            )
+        )
+        dry = _run_script(
+            "--collection", COLLECTION,
+            "--file-id", "safe-doc", "--file-id", "stale-doc",
+            "--manifesto", str(manifesto),
+        )
+        assert dry.returncode == 0, dry.stderr
+        approved = manifesto.read_bytes()
+        groups = json.loads(approved)["grupos"]
+        keeper = next(g["manter_uuid"] for g in groups if g["file_id"] == "stale-doc")
+
+        async def _delete_keeper():
+            conn = await _connect()
+            try:
+                await conn.execute(
+                    "DELETE FROM langchain_pg_embedding WHERE uuid = $1::uuid", keeper
+                )
+            finally:
+                await conn.close()
+
+        asyncio.run(_delete_keeper())
+        assert asyncio.run(_count()) == 4
+
+        run = _run_script("--manifesto", str(manifesto), "--execute", "--yes")
+
+        assert run.returncode != 0
+        assert "manter_uuid" in run.stderr and "ausente" in run.stderr
+        assert keeper in run.stderr
+        assert asyncio.run(_count("cmetadata->>'file_id' = 'safe-doc'")) == 3
+        assert asyncio.run(_count("cmetadata->>'file_id' = 'stale-doc'")) == 1
+        assert manifesto.read_bytes() == approved
+        assert not manifesto.with_suffix(".json.execucao.json").exists()
+
     def test_execute_without_manifest_refused(self):
         run = _run_script("--execute", "--yes")
         assert run.returncode != 0
@@ -410,3 +526,64 @@ class TestExecuteRefusals:
         )
         assert run.returncode != 0
         assert "manifesto" in (run.stderr + run.stdout)
+
+    def test_execute_refuses_manifest_generated_without_namespace(self, tmp_path):
+        """Rodada 3 (bloqueante): dry-run com --no-by-namespace seguido de
+        --execute SEM a flag é recusado — o manifesto prova COMO foi gerado
+        (by_namespace=false) e a fusão de cópias legítimas não vira delete."""
+        manifesto = tmp_path / "manifesto.json"
+        asyncio.run(
+            _insert_rows(
+                [
+                    ("ns-doc", "user-1", 0, 0, "MESMO", "/tmp/1.pdf"),
+                    ("ns-doc", "user-1", 0, 0, "MESMO", "/tmp/1b.pdf"),
+                    ("ns-doc", "agent-2", 0, 0, "MESMO", "/tmp/2.pdf"),
+                ]
+            )
+        )
+
+        dry = _run_script(
+            "--collection", COLLECTION,
+            "--file-id", "ns-doc",
+            "--no-by-namespace",
+            "--manifesto", str(manifesto),
+        )
+        assert dry.returncode == 0, dry.stderr
+        assert asyncio.run(_count()) == 3
+        m = json.loads(manifesto.read_text())
+        assert m["by_namespace"] is False
+        # O inventário sem namespace tem candidatos, mas não autoriza exclusão.
+        assert m["candidatos_total"] >= 1
+
+        run = _run_script("--manifesto", str(manifesto), "--execute", "--yes")
+        assert run.returncode != 0
+        assert "namespace" in (run.stderr + run.stdout)
+        # nada foi apagado: cópias de ambos os namespaces sobrevivem
+        assert asyncio.run(_count()) == 3
+
+    def test_execute_warns_when_schema_diverges(self, tmp_path):
+        """Rodada 3 (sugestão): --schema diferente do schema do manifesto avisa
+        antes da confirmação (a execução é abortada pelo keeper ausente)."""
+        manifesto = tmp_path / "manifesto.json"
+        manifesto.write_text(
+            json.dumps(
+                {
+                    "card": "278-citacoes-duplicadas",
+                    "gerado_em": "2026-10-22T00:00:00Z",
+                    "schema": "schema_do_dry_run",
+                    "by_namespace": True,
+                    "agrupamento": GROUPING_DESCRIPTION,
+                    "grupos": [{
+                        "namespace": "user-1",
+                        "namespaces_presentes": ["user-1"],
+                        "manter_uuid": str(uuid.uuid4()),
+                        "remover_uuids": [str(uuid.uuid4())],
+                    }],
+                }
+            )
+        )
+        run = _run_script("--manifesto", str(manifesto), "--execute", "--yes")
+        assert run.returncode != 0  # keeper ausente, para depois do aviso
+        combined = run.stdout + run.stderr
+        assert "diverge" in combined
+        assert "schema_do_dry_run" in combined

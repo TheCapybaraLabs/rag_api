@@ -6,7 +6,9 @@ Covers:
     concurrent unique-violation reported as deduplicated (never delete-by-file_id)
   * _process_documents_async_pipeline / _process_documents_batched_sync: rollback
     scoped to namespace, skipped on unique violation
-  * _is_unique_violation: IntegrityError / pgcode 23505 / asyncpg UniqueViolationError
+  * _is_unique_violation: IntegrityError de corrida (pgcode 23505 /
+    asyncpg UniqueViolationError) é detectado; IntegrityError NÃO-unique
+    (NOT NULL/FK/CHECK) NÃO é — rollback normal acontece
   * /query: namespace filter applied before top-k, per-result validation,
     legacy fallback filtered to user_id IS NULL, '' never authorized
 """
@@ -46,6 +48,23 @@ def _integrity_error() -> Exception:
         asyncpg.UniqueViolationError(
             "duplicate key value violates unique constraint "
             "uq_langchain_pg_embedding_chunk_identity"
+        ),
+    )
+
+
+def _not_null_integrity_error() -> Exception:
+    """SQLAlchemy IntegrityError que NÃO é corrida perdida: violação NOT NULL
+    (pgcode 23502). Antes do fix da rodada 3, qualquer IntegrityError era
+    tratado como unique e o rollback era pulado erroneamente."""
+    import asyncpg
+    from sqlalchemy.exc import IntegrityError
+
+    return IntegrityError(
+        "INSERT INTO langchain_pg_embedding ...",
+        {},
+        asyncpg.NotNullViolationError(
+            'null value in column "embedding" of relation '
+            '"langchain_pg_embedding" violates not-null constraint'
         ),
     )
 
@@ -497,7 +516,94 @@ class TestSyncBatchUniqueViolation:
         store.delete_file_batch.assert_not_called()
 
 
+class TestNonUniqueIntegrityErrorRollsBack:
+    """Rodada 3 — regressão da rodada 2: só corrida perdida (unique) pula rollback.
+    NOT NULL/FK/CHECK num batch posterior é falha real: rollback normal acontece."""
+
+    def _store(self):
+        class FakeAsyncStore(AsyncPgVector):
+            def __init__(self):  # skip PGVector machinery (conftest dummies it too)
+                pass
+
+        store = FakeAsyncStore()
+        store.delete = AsyncMock()
+        store.delete_file_batch = AsyncMock(return_value=0)
+        return store
+
+    def _docs(self, n=6):
+        return [Document(page_content=f"c{i}", metadata={"chunk_index": i}) for i in range(n)]
+
+    async def test_async_pipeline_rolls_back_on_non_unique_integrity_error(self):
+        from app.routes.document_routes import _process_documents_async_pipeline
+
+        store = self._store()
+        # 1º lote insere; 2º falha com IntegrityError de NOT NULL (não é corrida)
+        store.aadd_documents = AsyncMock(
+            side_effect=[["id1"], _not_null_integrity_error()]
+        )
+
+        with patch_pipeline_batch_size(2):
+            with pytest.raises(Exception):
+                await _process_documents_async_pipeline(
+                    documents=self._docs(),
+                    file_id="file-1",
+                    vector_store=store,
+                    executor=None,
+                    user_id="user-1",
+                )
+
+        store.delete_file_batch.assert_awaited_once_with(
+            "file-1", "user-1", executor=None
+        )
+        store.delete.assert_not_called()
+
+    async def test_sync_batched_rolls_back_on_non_unique_integrity_error(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        from unittest.mock import Mock
+
+        from app.routes.document_routes import _process_documents_batched_sync
+
+        store = Mock()
+        store.delete = Mock()
+        store.delete_file_batch = Mock(return_value=0)
+        store.add_documents = Mock(side_effect=[["id1"], _not_null_integrity_error()])
+
+        with patch_pipeline_batch_size(2):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                with pytest.raises(Exception):
+                    await _process_documents_batched_sync(
+                        documents=[Document(page_content=f"c{i}") for i in range(4)],
+                        file_id="file-1",
+                        vector_store=store,
+                        executor=executor,
+                        user_id="user-1",
+                    )
+
+        store.delete_file_batch.assert_called_once_with("file-1", "user-1")
+        store.delete.assert_not_called()
+
+
 class TestIsUniqueViolation:
+    @pytest.mark.parametrize("code", ["23502", "23503", "23514"])
+    @pytest.mark.parametrize("code_attribute", ["pgcode", "sqlstate"])
+    def test_other_integrity_sqlstates_are_not_unique(self, code, code_attribute):
+        from sqlalchemy.exc import IntegrityError
+
+        orig = Exception("constraint violation")
+        setattr(orig, code_attribute, code)
+        exc = IntegrityError("INSERT ...", {}, orig)
+        assert document_routes._is_unique_violation(exc) is False
+
+    @pytest.mark.parametrize("code_attribute", ["pgcode", "sqlstate"])
+    def test_unique_sqlstate_is_detected_without_message(self, code_attribute):
+        from sqlalchemy.exc import IntegrityError
+
+        orig = Exception("constraint violation")
+        setattr(orig, code_attribute, "23505")
+        exc = IntegrityError("INSERT ...", {}, orig)
+        assert document_routes._is_unique_violation(exc) is True
+
     def test_sqlalchemy_integrity_error_is_detected(self):
         from sqlalchemy.exc import IntegrityError
 
@@ -524,6 +630,22 @@ class TestIsUniqueViolation:
 
     def test_plain_error_is_not_unique_violation(self):
         assert document_routes._is_unique_violation(RuntimeError("boom")) is False
+
+    def test_not_null_integrity_error_is_not_unique_violation(self):
+        """Rodada 3: IntegrityError de NOT NULL (23502) NÃO é corrida perdida."""
+        exc = _not_null_integrity_error()
+        assert document_routes._is_unique_violation(exc) is False
+
+    def test_foreign_key_integrity_error_is_not_unique_violation(self):
+        """FK/CHECK sem pgcode e sem mensagem de unique também não são."""
+        from sqlalchemy.exc import IntegrityError
+
+        exc = IntegrityError(
+            "INSERT INTO langchain_pg_embedding ...",
+            {},
+            Exception('update or insert violates foreign key constraint "fk_col"'),
+        )
+        assert document_routes._is_unique_violation(exc) is False
 
 
 class TestConcurrentIngestReportsDeduplicated:

@@ -789,22 +789,34 @@ def _is_unique_violation(exc: BaseException) -> bool:
     Detecting it lets the rollback paths refuse to delete by file_id — the rows now
     stored may belong to the winning request (or to other namespaces), and deleting
     them turns a benign race into data loss.
+
+    A detecção é restrita à violação UNIQUE (pgcode/sqlstate 23505,
+    UniqueViolationError ou a mensagem literal do Postgres). Qualquer OUTRO
+    IntegrityError (NOT NULL, FK, CHECK) não é corrida perdida: o lote falhou de
+    verdade e precisa do rollback normal — tratá-lo como corrida pularia o
+    rollback e deixaria o arquivo meio ingerido.
     """
     seen = set()
     current = exc
     while current is not None and id(current) not in seen:
         seen.add(id(current))
-        if IntegrityError is not None and isinstance(current, IntegrityError):
+        # A cadeia DBAPI do SQLAlchemy expõe o erro do driver em .orig; o próprio
+        # current pode já ser o erro do driver (asyncpg) — checar os dois.
+        for candidate in (current, getattr(current, "orig", None)):
+            if candidate is None:
+                continue
+            if (
+                getattr(candidate, "pgcode", None) == "23505"
+                or getattr(candidate, "sqlstate", None) == "23505"
+            ):
+                return True
+            if _UNIQUE_VIOLATION_TYPES and isinstance(
+                candidate, _UNIQUE_VIOLATION_TYPES
+            ):
+                return True
+        if "duplicate key value violates unique constraint" in str(current).lower():
             return True
         orig = getattr(current, "orig", None)
-        pgcode = getattr(orig, "pgcode", None)
-        if pgcode == "23505":  # unique_violation
-            return True
-        if _UNIQUE_VIOLATION_TYPES and isinstance(orig, _UNIQUE_VIOLATION_TYPES):
-            return True
-        text = str(current).lower()
-        if "duplicate key value violates unique constraint" in text:
-            return True
         current = orig if orig is not None else getattr(current, "__cause__", None)
     return False
 

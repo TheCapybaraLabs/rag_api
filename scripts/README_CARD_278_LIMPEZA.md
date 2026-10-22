@@ -33,6 +33,10 @@ temporário do provisionador), mas **não é critério de limpeza**.
 4. **Sobrevivente = linha mais antiga**: menor `ctid` (ordem física de inserção).
    **Não** se usa o menor uuid — uuid v4 é aleatório e preservaria o lote por
    acaso (possivelmente o lixo `provision-/temp`).
+   `ctid` é uma **heurística**, não uma garantia de antiguidade: deletes liberam
+   espaço e novos inserts podem reutilizar páginas com `ctid` menor;
+   `VACUUM FULL`, `CLUSTER` e `pg_repack` também podem mudar a ordem física.
+   Revise o `manter_uuid` de cada grupo antes de aprovar o manifesto.
 5. **Não usar `DELETE /documents`** para este fim: apaga por arquivo e atinge
    todos os namespaces.
 
@@ -71,9 +75,19 @@ python scripts/cleanup_duplicate_vectors.py \
 O que o modo `--execute` faz, em ordem:
 
 1. **Lê os `remover_uuids` do manifesto do dry-run** (exige `--manifesto`;
-   recusa `--file-id`/`--all`, que não participam da seleção).
-2. Verifica quais desses uuids **ainda existem** (avisa os sumidos; só eles
-   diferem da lista aprovada).
+   recusa `--file-id`/`--all`, que não participam da seleção). O manifesto
+   grava `by_namespace` — como o dry-run agrupou. `--execute` **recusa**
+   manifesto com `by_namespace` ausente ou `false`: dry-run com
+   `--no-by-namespace` funde cópias legítimas do mesmo chunk entre agentes e
+   não pode virar delete (nem com a flag ausente na linha do `--execute`).
+   Também exige `agrupamento` igual à descrição padrão por namespace e cada
+   grupo com `namespace` e `namespaces_presentes` contendo somente esse namespace.
+   Divergência entre o `schema` do manifesto e o `--schema` alvo gera **aviso**
+   antes da confirmação.
+2. Na transação do snapshot/delete, verifica que **todos os `manter_uuid` ainda
+   existem** e os bloqueia contra exclusão até o commit. Keeper ausente recusa
+   toda a execução com erro, sem apagar nenhum grupo. Verifica quais candidatos
+   **ainda existem** (avisa os sumidos; só eles diferem da lista aprovada).
 3. Numa **única transação**: cria o snapshot `card278_backup_<ts>` com as linhas
    completas (embedding + `cmetadata` + `document`) e exclui **exatamente** os
    uuids verificados. Se o count do delete divergir do snapshot, a transação é
