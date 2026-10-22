@@ -128,6 +128,18 @@ def override_vector_store(monkeypatch):
 
     monkeypatch.setattr(AsyncPgVector, "delete", dummy_delete)
 
+    # Card #278: batch-dedup helpers default to "nothing stored" so /embed inserts.
+    async def dummy_get_file_batch_digests(self, file_id, user_id, executor=None):
+        return None
+
+    async def dummy_delete_file_batch(self, file_id, user_id, executor=None):
+        return 0
+
+    monkeypatch.setattr(
+        AsyncPgVector, "get_file_batch_digests", dummy_get_file_batch_digests
+    )
+    monkeypatch.setattr(AsyncPgVector, "delete_file_batch", dummy_delete_file_batch)
+
 
 def test_get_all_ids(auth_headers):
     response = client.get("/ids", headers=auth_headers)
@@ -209,6 +221,33 @@ def test_embed_file(tmp_path, auth_headers):
     json_data = response.json()
     assert json_data["status"] is True
     assert json_data["file_id"] == "testid1"
+    assert json_data["deduplicated"] is False
+
+
+def test_embed_file_reports_dedup_when_batch_already_stored(auth_headers, monkeypatch):
+    """Card #278: an identical re-upload reports deduplicated instead of re-embedding."""
+    from app.services.vector_store.async_pg_vector import AsyncPgVector
+
+    async def stored_batch(self, file_id, user_id, executor=None):
+        # digest of the single chunk the TextLoader produces for the content below
+        import hashlib
+
+        content = "Dedup content for the embed endpoint."
+        return [hashlib.md5(content.encode("utf-8", "ignore")).hexdigest()]
+
+    monkeypatch.setattr(AsyncPgVector, "get_file_batch_digests", stored_batch)
+
+    file_content = "Dedup content for the embed endpoint."
+    response = client.post(
+        "/embed",
+        data={"file_id": "dedupid", "entity_id": "testuser"},
+        files={"file": ("dedup.txt", file_content.encode(), "text/plain")},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, f"Response: {response.text}"
+    json_data = response.json()
+    assert json_data["status"] is True
+    assert json_data["deduplicated"] is True
 
 
 def test_load_document_context(auth_headers):

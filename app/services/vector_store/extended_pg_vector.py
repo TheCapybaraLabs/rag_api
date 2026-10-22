@@ -177,6 +177,48 @@ class ExtendedPgVector(PGVector):
             results = session.query(self.EmbeddingStore.custom_id).all()
             return [result[0] for result in results if result[0] is not None]
 
+    def get_file_batch_digests(self, file_id: str, user_id: str) -> Optional[list[str]]:
+        """Digests of the batch stored for this file in this namespace, or None when the
+        file has no rows here.
+
+        A "batch" is every row whose custom_id (file_id) and cmetadata user_id match:
+        the namespace is part of the identity, because agents sharing a file record
+        each hold their own embedding by contract. Powers the idempotent /embed check.
+        """
+        with Session(self._bind) as session:
+            collection = self.get_collection(session)
+            if not collection:
+                return None
+            rows = (
+                session.query(self.EmbeddingStore.cmetadata)
+                .filter(
+                    self.EmbeddingStore.collection_id == collection.uuid,
+                    self.EmbeddingStore.custom_id == file_id,
+                    self.EmbeddingStore.cmetadata["user_id"].astext == user_id,
+                )
+                .all()
+            )
+            if not rows:
+                return None
+            return [(row[0] or {}).get("digest", "") for row in rows]
+
+    def delete_file_batch(self, file_id: str, user_id: str) -> int:
+        """Deletes only this namespace's rows for the file. Other namespaces sharing the
+        same file_id (agents sharing a record) are untouched, unlike delete(ids=[...])
+        which spans every namespace. Returns the number of rows removed."""
+        with Session(self._bind) as session:
+            collection = self.get_collection(session)
+            if not collection:
+                return 0
+            stmt = delete(self.EmbeddingStore).where(
+                self.EmbeddingStore.collection_id == collection.uuid,
+                self.EmbeddingStore.custom_id == file_id,
+                self.EmbeddingStore.cmetadata["user_id"].astext == user_id,
+            )
+            result = session.execute(stmt)
+            session.commit()
+            return result.rowcount or 0
+
     def get_filtered_ids(self, ids: list[str]) -> list[str]:
         with Session(self._bind) as session:
             query = session.query(self.EmbeddingStore.custom_id).filter(

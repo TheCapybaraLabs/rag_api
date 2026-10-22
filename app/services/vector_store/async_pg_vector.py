@@ -98,3 +98,21 @@ class AsyncPgVector(ExtendedPgVector):
         return await self._run_in_executor(
             executor, super().add_documents, documents, ids=ids, **kwargs
         )
+
+    async def get_file_batch_digests(
+        self, file_id: str, user_id: str, executor=None
+    ) -> Optional[List[str]]:
+        """Async version of get_file_batch_digests"""
+        executor = executor or self._get_thread_pool()
+        return await self._run_in_executor(
+            executor, super().get_file_batch_digests, file_id, user_id
+        )
+
+    async def delete_file_batch(
+        self, file_id: str, user_id: str, executor=None
+    ) -> int:
+        """Async version of delete_file_batch"""
+        executor = executor or self._get_thread_pool()
+        return await self._run_in_executor(
+            executor, super().delete_file_batch, file_id, user_id
+        )
